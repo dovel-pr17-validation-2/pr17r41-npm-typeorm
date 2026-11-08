@@ -1,0 +1,260 @@
+import {
+  DynamicModule,
+  Global,
+  Inject,
+  Logger,
+  Module,
+  OnApplicationShutdown,
+  Provider,
+  Type,
+} from '@nestjs/common';
+import { ModuleRef } from '@nestjs/core';
+import { defer, lastValueFrom } from 'rxjs';
+import { DataSource, DataSourceOptions } from 'typeorm';
+import { Connection } from './common/typeorm-compat.js';
+import {
+  generateString,
+  getDataSourceName,
+  getDataSourceToken,
+  getEntityManagerToken,
+  handleRetry,
+} from './common/typeorm.utils.js';
+import { DataSourceNameRegistry } from './data-source-name.registry.js';
+import { EntitiesMetadataStorage } from './entities-metadata.storage.js';
+import {
+  TypeOrmDataSourceFactory,
+  TypeOrmModuleAsyncOptions,
+  TypeOrmModuleOptions,
+  TypeOrmOptionsFactory,
+} from './interfaces/typeorm-options.interface.js';
+import {
+  TYPEORM_DATA_SOURCE_NAME,
+  TYPEORM_MODULE_ID,
+  TYPEORM_MODULE_OPTIONS,
+} from './typeorm.constants.js';
+
+@Global()
+@Module({})
+export class TypeOrmCoreModule implements OnApplicationShutdown {
+  private readonly logger = new Logger('TypeOrmModule');
+
+  constructor(
+    @Inject(TYPEORM_DATA_SOURCE_NAME)
+    private readonly dataSourceName: string,
+    private readonly moduleRef: ModuleRef,
+  ) {}
+
+  static forRoot(options: TypeOrmModuleOptions = {}): DynamicModule {
+    const dataSourceName = getDataSourceName(options);
+    DataSourceNameRegistry.register(dataSourceName);
+    const typeOrmModuleOptions = {
+      provide: TYPEORM_MODULE_OPTIONS,
+      useValue: options,
+    };
+    const dataSourceProvider = {
+      provide: getDataSourceToken(dataSourceName),
+      useFactory: async () => await this.createDataSourceFactory(options),
+    };
+    const entityManagerProvider = this.createEntityManagerProvider(
+      options as DataSourceOptions,
+    );
+
+    const providers = [
+      entityManagerProvider,
+      dataSourceProvider,
+      typeOrmModuleOptions,
+      {
+        provide: TYPEORM_DATA_SOURCE_NAME,
+        useValue: dataSourceName,
+      },
+    ];
+    const exports = [entityManagerProvider, dataSourceProvider];
+
+    if (Connection && dataSourceProvider.provide === DataSource) {
+      providers.push({
+        provide: Connection,
+        useExisting: DataSource,
+      });
+      exports.push(Connection);
+    }
+
+    return {
+      module: TypeOrmCoreModule,
+      providers,
+      exports,
+    };
+  }
+
+  static forRootAsync(options: TypeOrmModuleAsyncOptions): DynamicModule {
+    const dataSourceName = getDataSourceName(options);
+    DataSourceNameRegistry.register(dataSourceName);
+    const dataSourceProvider = {
+      provide: getDataSourceToken(dataSourceName),
+      useFactory: async (typeOrmOptions: TypeOrmModuleOptions) => {
+        if (options.name) {
+          return await this.createDataSourceFactory(
+            {
+              ...typeOrmOptions,
+              name: options.name,
+            },
+            options.dataSourceFactory,
+          );
+        }
+        return await this.createDataSourceFactory(
+          typeOrmOptions,
+          options.dataSourceFactory,
+        );
+      },
+      inject: [TYPEORM_MODULE_OPTIONS],
+    };
+    const entityManagerProvider = {
+      provide: getEntityManagerToken(dataSourceName) as string,
+      useFactory: (dataSource: DataSource) => dataSource.manager,
+      inject: [getDataSourceToken(dataSourceName)],
+    };
+
+    const asyncProviders = this.createAsyncProviders(options);
+    const providers = [
+      ...asyncProviders,
+      entityManagerProvider,
+      dataSourceProvider,
+      {
+        provide: TYPEORM_MODULE_ID,
+        useValue: generateString(),
+      },
+      {
+        provide: TYPEORM_DATA_SOURCE_NAME,
+        useValue: dataSourceName,
+      },
+      ...(options.extraProviders || []),
+    ];
+    const exports: Array<Provider | Function> = [
+      entityManagerProvider,
+      dataSourceProvider,
+    ];
+
+    if (Connection && dataSourceProvider.provide === DataSource) {
+      providers.push({
+        provide: Connection,
+        useExisting: DataSource,
+      });
+      exports.push(Connection);
+    }
+
+    return {
+      module: TypeOrmCoreModule,
+      imports: options.imports,
+      providers,
+      exports,
+    };
+  }
+
+  async onApplicationShutdown(): Promise<void> {
+    try {
+      const dataSource = this.moduleRef.get<DataSource>(
+        getDataSourceToken(this.dataSourceName) as Type<DataSource>,
+      );
+      if (dataSource && dataSource.isInitialized) {
+        await dataSource.destroy();
+      }
+    } catch (e: any) {
+      this.logger.error(
+        `Failed to close the "${this.dataSourceName}" data source: ${e?.message}`,
+        e?.stack,
+      );
+    } finally {
+      DataSourceNameRegistry.unregister(this.dataSourceName);
+    }
+  }
+
+  private static createAsyncProviders(
+    options: TypeOrmModuleAsyncOptions,
+  ): Provider[] {
+    if (options.useExisting || options.useFactory) {
+      return [this.createAsyncOptionsProvider(options)];
+    }
+    const useClass = options.useClass as Type<TypeOrmOptionsFactory>;
+    return [
+      this.createAsyncOptionsProvider(options),
+      {
+        provide: useClass,
+        useClass,
+      },
+    ];
+  }
+
+  private static createAsyncOptionsProvider(
+    options: TypeOrmModuleAsyncOptions,
+  ): Provider {
+    if (options.useFactory) {
+      return {
+        provide: TYPEORM_MODULE_OPTIONS,
+        useFactory: options.useFactory,
+        inject: options.inject || [],
+      };
+    }
+    // `as Type<TypeOrmOptionsFactory>` is a workaround for microsoft/TypeScript#31603
+    const inject = [
+      (options.useClass || options.useExisting) as Type<TypeOrmOptionsFactory>,
+    ];
+    return {
+      provide: TYPEORM_MODULE_OPTIONS,
+      useFactory: async (optionsFactory: TypeOrmOptionsFactory) =>
+        await optionsFactory.createTypeOrmOptions(options.name),
+      inject,
+    };
+  }
+
+  private static createEntityManagerProvider(
+    options: DataSourceOptions,
+  ): Provider {
+    return {
+      provide: getEntityManagerToken(options) as string,
+      useFactory: (dataSource: DataSource) => dataSource.manager,
+      inject: [getDataSourceToken(options)],
+    };
+  }
+
+  private static async createDataSourceFactory(
+    options: TypeOrmModuleOptions,
+    dataSourceFactory?: TypeOrmDataSourceFactory,
+  ): Promise<DataSource> {
+    const dataSourceToken = getDataSourceName(options);
+    const createTypeormDataSource =
+      dataSourceFactory ??
+      ((options: DataSourceOptions) => new DataSource(options));
+    return await lastValueFrom(
+      defer(async () => {
+        let dataSource: DataSource;
+        if (!options.autoLoadEntities) {
+          dataSource = await createTypeormDataSource(
+            options as DataSourceOptions,
+          );
+        } else {
+          // `entities` can be an array or an object map (e.g. `import * as entities`)
+          const explicitEntities = Array.isArray(options.entities)
+            ? options.entities
+            : Object.values(options.entities ?? {});
+          const entities = explicitEntities.concat(
+            EntitiesMetadataStorage.getEntitiesByDataSource(dataSourceToken),
+          );
+          dataSource = await createTypeormDataSource({
+            ...options,
+            entities,
+          } as DataSourceOptions);
+        }
+        return !dataSource.isInitialized && !options.manualInitialization
+          ? dataSource.initialize()
+          : dataSource;
+      }).pipe(
+        handleRetry(
+          options.retryAttempts,
+          options.retryDelay,
+          dataSourceToken,
+          options.verboseRetryLog,
+          options.toRetry,
+        ),
+      ),
+    );
+  }
+}
